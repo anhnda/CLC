@@ -22,7 +22,7 @@ DRIFT_N_SAMPLES="${DRIFT_N_SAMPLES:-32}"
 DRIFT_MAX_LENGTH="${DRIFT_MAX_LENGTH:-512}"
 
 # CLC hyperparameters (defaults matching the main-paper config).
-BITS="${BITS:-4}"
+BITS="${BITS:-3}"
 KNEE_TOLERANCE="${KNEE_TOLERANCE:-0.0}"
 MAX_FLIP_PERCENT="${MAX_FLIP_PERCENT:-0.05}"
 

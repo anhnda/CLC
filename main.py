@@ -169,7 +169,7 @@ def run_perplexity_evaluation(args, model_paths: dict[str, str]) -> dict:
     return evaluator.run(model_paths, include_c4=args.include_c4, c4_samples=args.c4_samples)
 
 
-def run_lm_eval(args, model_paths: dict[str, str]) -> dict:
+def run_lm_eval(args, model_paths: dict[str, str], on_progress=None) -> dict:
     from src.evaluation.lm_eval import LMEvalHarnessRunner
 
     runner = LMEvalHarnessRunner(
@@ -181,7 +181,7 @@ def run_lm_eval(args, model_paths: dict[str, str]) -> dict:
         run_name=getattr(args, "resolved_run_name", args.run_name),
         hf_token=resolve_hf_token(),
     )
-    return runner.run(model_paths)
+    return runner.run(model_paths, on_progress=on_progress)
 
 
 def save_evaluation_results(results: dict, output_path: Path):
@@ -290,15 +290,25 @@ def evaluate_model_paths(args, model_paths: dict[str, str], variant: str = "eval
     run_name = resolve_run_name(args, variant)
     model_ref = getattr(args, "resolved_source_model", None) or getattr(args, "model_path", None) or next(iter(model_paths.values()))
     model_slug = build_model_slug(model_ref)
+    output_path = Path(args.results_eval_dir) / f"{run_name}.json"
+
+    # Compute + persist perplexity FIRST. If the (heavy) lm-eval stage later
+    # crashes, the PPL numbers are already safe on disk.
     combined_results = {
         "perplexity": run_perplexity_evaluation(args, model_paths),
     }
+    save_evaluation_results(combined_results, output_path)
+    print(f"[evaluate] perplexity checkpointed -> {output_path}")
 
     if args.include_lm_eval:
-        combined_results["lm_eval"] = run_lm_eval(args, model_paths)
+        def _lm_checkpoint(results_so_far):
+            combined_results["lm_eval"] = results_so_far
+            save_evaluation_results(combined_results, output_path)
+            print(f"[evaluate] lm-eval progress checkpointed ({len(results_so_far)} model(s)) -> {output_path}")
 
-    output_path = Path(args.results_eval_dir) / f"{run_name}.json"
-    save_evaluation_results(combined_results, output_path)
+        combined_results["lm_eval"] = run_lm_eval(args, model_paths, on_progress=_lm_checkpoint)
+        save_evaluation_results(combined_results, output_path)
+        print(f"[evaluate] lm-eval results appended -> {output_path}")
     if getattr(args, "use_wandb", False):
         log_results_to_wandb(args, run_name, variant, model_paths, combined_results, model_slug)
     print(f"\nSaved evaluation results to {output_path}")
@@ -703,14 +713,28 @@ def run_calib_sweep(args):
         "bits": args.bits,
         "calib_dataset": "c4",
         "calib_sizes": list(args.calib_sweep),
+        "status": "running",
+        "completed_sizes": [],
+        "fp16": None,
         "sweep": {},
     }
+
+    # Output path resolved up-front so we can checkpoint after every step.
+    run_name = resolve_run_name(args, "calib_sweep")
+    output_path = Path(args.results_eval_dir) / f"{run_name}.json"
+
+    def _checkpoint():
+        # Write the full results dict to disk NOW. Called after every milestone
+        # so a crash mid-sweep still leaves all completed numbers on disk.
+        save_evaluation_results(results, output_path)
+        print(f"[calib_sweep] checkpoint -> {output_path}")
 
     # --- FP16 baseline: measured once (independent of calibration) ------------
     print("\n[calib_sweep] measuring FP16 perplexity (once) ...")
     fp_ppl = run_perplexity_evaluation(args, {"float_model": fp_ref})
     results["fp16"] = _ppl_of(fp_ppl, "float_model")
     print(f"[calib_sweep] FP16 PPL: {results['fp16']}")
+    _checkpoint()  # <-- FP16 persisted before any quantization starts
 
     # --- Sweep over calibration sizes -----------------------------------------
     for size in args.calib_sweep:
@@ -731,6 +755,9 @@ def run_calib_sweep(args):
                 "awq_raw": _ppl_of(ppl, "awq_raw"),
                 "awq_clc": _ppl_of(ppl, "awq_clc"),
             }
+            results["completed_sizes"].append(size)
+            print(f"[calib_sweep] n={size} -> {results['sweep'][str(size)]}")
+            _checkpoint()  # <-- this size persisted before moving on
         finally:
             shutil.rmtree(base_dir, ignore_errors=True)
             shutil.rmtree(clc_dir, ignore_errors=True)
@@ -738,12 +765,8 @@ def run_calib_sweep(args):
             _gc.collect()
             torch.cuda.empty_cache()
 
-        print(f"[calib_sweep] n={size} -> {results['sweep'][str(size)]}")
-
-    # --- Persist + print a compact table --------------------------------------
-    run_name = resolve_run_name(args, "calib_sweep")
-    output_path = Path(args.results_eval_dir) / f"{run_name}.json"
-    save_evaluation_results(results, output_path)
+    results["status"] = "done"
+    _checkpoint()  # final write with status flipped to done
 
     def _fmt(d, ds):
         v = d.get(ds)

@@ -124,9 +124,18 @@ class LMEvalHarnessRunner:
             "raw": safe_payload,
         }
 
-    def run(self, model_paths: Dict[str, str]) -> dict:
+    def run(self, model_paths: Dict[str, str], on_progress=None) -> dict:
+        """Evaluate each model. If on_progress is given, it is called as
+        on_progress(results_so_far) after every model, so the caller can
+        checkpoint partial results to disk instead of waiting for all models.
+        """
         results = {}
         for model_name, model_path in model_paths.items():
             print(f"\nRunning lm-eval for {model_name} on {', ' .join(self.tasks)}...")
             results[model_name] = self.evaluate_model(model_name, model_path)
+            if on_progress is not None:
+                try:
+                    on_progress(results)
+                except Exception as exc:  # checkpointing must never kill the run
+                    print(f"[lm-eval] on_progress checkpoint failed: {exc}")
         return results

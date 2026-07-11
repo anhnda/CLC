@@ -668,6 +668,101 @@ def run_gsm8k_compare(args):
     return output_path
 
 
+def _ppl_of(perplexity_block: dict, model_key: str) -> dict:
+    """Pull {WikiText-2, C4} PPL for one model out of SlidingWindowEvaluator output."""
+    out = {}
+    for ds in ("WikiText-2", "C4"):
+        entry = perplexity_block.get(ds, {}).get(model_key)
+        if isinstance(entry, dict) and "perplexity" in entry:
+            out[ds] = entry["perplexity"]
+    return out
+
+
+def run_calib_sweep(args):
+    """Sweep C4 calibration-set size and report perplexity only.
+
+    FP16 perplexity is measured once (calibration-independent). For each
+    calibration size in --calib-sweep, AWQ (base) and AWQ+CLC are quantized,
+    their perplexity is measured, and the quantized model dirs are deleted before
+    moving on so disk usage stays flat. All numbers are collected into a single
+    JSON plus a printed table.
+    """
+    if args.origin_method != "awq":
+        raise NotImplementedError("calib_sweep currently supports --origin-method awq only")
+
+    # Calibration always drawn from C4 for this sweep.
+    args.calib_dataset = "c4"
+    fp_ref = resolve_model_reference(args.model_path, models_root=args.models_root)
+    args.resolved_source_model = fp_ref
+
+    # PPL is the only thing we measure here.
+    args.include_lm_eval = False
+
+    results = {
+        "model": fp_ref,
+        "bits": args.bits,
+        "calib_dataset": "c4",
+        "calib_sizes": list(args.calib_sweep),
+        "sweep": {},
+    }
+
+    # --- FP16 baseline: measured once (independent of calibration) ------------
+    print("\n[calib_sweep] measuring FP16 perplexity (once) ...")
+    fp_ppl = run_perplexity_evaluation(args, {"float_model": fp_ref})
+    results["fp16"] = _ppl_of(fp_ppl, "float_model")
+    print(f"[calib_sweep] FP16 PPL: {results['fp16']}")
+
+    # --- Sweep over calibration sizes -----------------------------------------
+    for size in args.calib_sweep:
+        print(f"\n[calib_sweep] ===== calibration size n={size} =====")
+        args.n_calib = int(size)
+
+        base_dir = _quantize_and_save(args, post_correction="none",
+                                      run_name=f"awq_raw_calib{size}_b{args.bits}")
+        clc_dir = _quantize_and_save(args, post_correction="clc",
+                                     run_name=f"awq_clc_calib{size}_b{args.bits}")
+
+        try:
+            ppl = run_perplexity_evaluation(args, {
+                "awq_raw": str(base_dir),
+                "awq_clc": str(clc_dir),
+            })
+            results["sweep"][str(size)] = {
+                "awq_raw": _ppl_of(ppl, "awq_raw"),
+                "awq_clc": _ppl_of(ppl, "awq_clc"),
+            }
+        finally:
+            shutil.rmtree(base_dir, ignore_errors=True)
+            shutil.rmtree(clc_dir, ignore_errors=True)
+            import gc as _gc
+            _gc.collect()
+            torch.cuda.empty_cache()
+
+        print(f"[calib_sweep] n={size} -> {results['sweep'][str(size)]}")
+
+    # --- Persist + print a compact table --------------------------------------
+    run_name = resolve_run_name(args, "calib_sweep")
+    output_path = Path(args.results_eval_dir) / f"{run_name}.json"
+    save_evaluation_results(results, output_path)
+
+    def _fmt(d, ds):
+        v = d.get(ds)
+        return f"{v:.4f}" if isinstance(v, (int, float)) else "  -  "
+
+    print("\n================ Calibration-size sweep (perplexity) ================")
+    print(f"Model: {fp_ref}  |  AWQ {args.bits}-bit  |  calib=C4")
+    print(f"{'setting':<18}{'WikiText-2':>12}{'C4':>10}")
+    print("-" * 40)
+    print(f"{'FP16':<18}{_fmt(results['fp16'],'WikiText-2'):>12}{_fmt(results['fp16'],'C4'):>10}")
+    for size in args.calib_sweep:
+        block = results["sweep"][str(size)]
+        print(f"{f'AWQ (n={size})':<18}{_fmt(block['awq_raw'],'WikiText-2'):>12}{_fmt(block['awq_raw'],'C4'):>10}")
+        print(f"{f'AWQ+CLC (n={size})':<18}{_fmt(block['awq_clc'],'WikiText-2'):>12}{_fmt(block['awq_clc'],'C4'):>10}")
+    print("=" * 68)
+    print(f"\n[calib_sweep] wrote {output_path}")
+    return output_path
+
+
 def build_parser():
     parser = argparse.ArgumentParser(description="Smart Flip quantization project entrypoint")
     subparsers = parser.add_subparsers(dest="mode", required=True)
@@ -778,6 +873,15 @@ def build_parser():
     gsm8k_compare.add_argument("--keep-quantized", action="store_true", default=False,
                                help="Keep the saved AWQ / AWQ+CLC model dirs after evaluation")
     gsm8k_compare.set_defaults(func=run_gsm8k_compare, post_correction="clc")
+
+    calib_sweep = subparsers.add_parser(
+        "calib_sweep",
+        help="Sweep C4 calibration size (perplexity only): FP16 vs AWQ vs AWQ+CLC",
+    )
+    add_quant_args(calib_sweep)
+    calib_sweep.add_argument("--calib-sweep", nargs="+", type=int, default=[64, 128, 256, 512],
+                             help="Calibration-set sizes to sweep over")
+    calib_sweep.set_defaults(func=run_calib_sweep, post_correction="clc", include_lm_eval=False)
 
     compare_all = subparsers.add_parser("compare_all", help="Evaluate float_model, raw_quantize, and flip_quantize together")
     compare_all.add_argument("--model-path", required=True, help="HF model name or local model path for the float model")

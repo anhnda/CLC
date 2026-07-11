@@ -567,6 +567,107 @@ def run_drift_eval_cmd(args):
     return output_path
 
 
+def _quantize_and_save(args, post_correction: str, run_name: str) -> Path:
+    """Quantize with AWQ (+ optional post-correction) and persist to disk.
+
+    Returns the saved model directory. Unlike run_quantize_with_evaluation this
+    does NOT delete the output afterward, so several quantized models can coexist
+    for a shared comparison (e.g. FP16 vs AWQ vs AWQ+CLC).
+    """
+    from src.calibration import load_calibration_data
+    from src.quantization.pipeline import QuantizationRecipe, create_quantizer
+
+    set_seed(args.seed)
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    resolved_source_model = resolve_model_reference(args.model_path, models_root=args.models_root)
+    recipe = QuantizationRecipe(origin_method=args.origin_method, post_correction=post_correction)
+    output_dir = build_output_dir(args.results_models_dir, recipe.variant_name, run_name)
+    hf_token = resolve_hf_token()
+
+    tokenizer = AutoTokenizer.from_pretrained(resolved_source_model, trust_remote_code=True, token=hf_token)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    model = AutoModelForCausalLM.from_pretrained(
+        resolved_source_model,
+        torch_dtype=torch.bfloat16,
+        trust_remote_code=True,
+        token=hf_token,
+        device_map="auto",
+    )
+    model.eval()
+
+    calibration_data = load_calibration_data(
+        args.calib_dataset,
+        tokenizer,
+        n_samples=args.n_calib,
+        seqlen=args.calib_seqlen,
+        seed=args.seed,
+        return_tensors=False,
+        cache_dir=args.calibration_cache_dir,
+    )
+
+    # Mutate args so create_quantizer picks up the requested post-correction.
+    args.post_correction = post_correction
+    quantizer, _base_config, _correction = create_quantizer(
+        model=model, tokenizer=tokenizer, device=device, args=args, recipe=recipe,
+    )
+    quantizer.quantize_model_sequential(calibration_data, n_samples=args.n_calib)
+
+    model.save_pretrained(output_dir, safe_serialization=True)
+    tokenizer.save_pretrained(output_dir)
+
+    del model, quantizer
+    import gc as _gc
+    _gc.collect()
+    torch.cuda.empty_cache()
+
+    print(f"[gsm8k_compare] saved {recipe.variant_name} -> {output_dir}")
+    return output_dir
+
+
+def run_gsm8k_compare(args):
+    """Compare FP16 / AWQ / AWQ+CLC on perplexity (as before) and GSM8K accuracy.
+
+    GSM8K is evaluated via lm-eval (task gsm8k_cot, 8-shot by default), matching:
+        lm-eval --model hf --tasks gsm8k_cot --num_fewshot 8 ...
+    """
+    if args.origin_method != "awq":
+        raise NotImplementedError("gsm8k_compare currently supports --origin-method awq only")
+
+    fp_ref = resolve_model_reference(args.model_path, models_root=args.models_root)
+    args.resolved_source_model = fp_ref
+
+    base_run = f"{args.origin_method}_raw_gsm8k_b{args.bits}"
+    clc_run = f"{args.origin_method}_clc_gsm8k_b{args.bits}"
+
+    base_dir = _quantize_and_save(args, post_correction="none", run_name=base_run)
+    clc_dir = _quantize_and_save(args, post_correction="clc", run_name=clc_run)
+
+    model_paths = {
+        "float_model": fp_ref,
+        "awq_raw": str(base_dir),
+        "awq_clc": str(clc_dir),
+    }
+
+    # Force GSM8K CoT 8-shot for this comparison (overriding preset tasks).
+    args.lm_eval_tasks = args.gsm8k_tasks
+    if args.lm_eval_num_fewshot is None:
+        args.lm_eval_num_fewshot = args.gsm8k_num_fewshot
+    args.include_lm_eval = True
+
+    try:
+        output_path = evaluate_model_paths(args, model_paths, variant="gsm8k_compare")
+    finally:
+        if not args.keep_quantized:
+            shutil.rmtree(base_dir, ignore_errors=True)
+            shutil.rmtree(clc_dir, ignore_errors=True)
+
+    print(f"\n[gsm8k_compare] wrote PPL + GSM8K comparison to {output_path}")
+    return output_path
+
+
 def build_parser():
     parser = argparse.ArgumentParser(description="Smart Flip quantization project entrypoint")
     subparsers = parser.add_subparsers(dest="mode", required=True)
@@ -664,6 +765,19 @@ def build_parser():
     drift_eval.add_argument("--drift-max-length", type=int, default=512,
                             help="Max tokens per eval sequence for drift measurement")
     drift_eval.set_defaults(func=run_drift_eval_cmd, post_correction="clc")
+
+    gsm8k_compare = subparsers.add_parser(
+        "gsm8k_compare",
+        help="Compare FP16 / AWQ / AWQ+CLC on perplexity and GSM8K (gsm8k_cot, 8-shot)",
+    )
+    add_quant_args(gsm8k_compare)
+    gsm8k_compare.add_argument("--gsm8k-tasks", nargs="+", default=["gsm8k_cot"],
+                               help="lm-eval task(s) for the math comparison")
+    gsm8k_compare.add_argument("--gsm8k-num-fewshot", type=int, default=8,
+                               help="Few-shot count for GSM8K (used if --lm-eval-num-fewshot unset)")
+    gsm8k_compare.add_argument("--keep-quantized", action="store_true", default=False,
+                               help="Keep the saved AWQ / AWQ+CLC model dirs after evaluation")
+    gsm8k_compare.set_defaults(func=run_gsm8k_compare, post_correction="clc")
 
     compare_all = subparsers.add_parser("compare_all", help="Evaluate float_model, raw_quantize, and flip_quantize together")
     compare_all.add_argument("--model-path", required=True, help="HF model name or local model path for the float model")

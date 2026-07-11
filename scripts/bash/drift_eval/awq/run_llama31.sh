@@ -6,7 +6,7 @@
 # Mirrors scripts/bash/clc/awq/run_llama31.sh for model/calibration settings.
 set -euo pipefail
 
-MODEL_PATH="${MODEL_PATH:-/home/DATA/prometheus/anh/.cache/huggingface/hub/models--meta-llama--Meta-Llama-3.1-8B/snapshots/d04e592bb4f6aa9cfee91e2e20afa771667e1d4b}"
+MODEL_PATH="${MODEL_PATH:-meta-llama/Meta-Llama-3.1-8B}"
 MODELS_ROOT="${MODELS_ROOT:-/models}"
 PYTHON_BIN="${PYTHON_BIN:-python}"
 RESULTS_EVAL_DIR="${RESULTS_EVAL_DIR:-./results/eval}"
@@ -22,7 +22,7 @@ DRIFT_N_SAMPLES="${DRIFT_N_SAMPLES:-32}"
 DRIFT_MAX_LENGTH="${DRIFT_MAX_LENGTH:-512}"
 
 # CLC hyperparameters (defaults matching the main-paper config).
-BITS="${BITS:-3}"
+BITS="${BITS:-4}"
 KNEE_TOLERANCE="${KNEE_TOLERANCE:-0.0}"
 MAX_FLIP_PERCENT="${MAX_FLIP_PERCENT:-0.05}"
 

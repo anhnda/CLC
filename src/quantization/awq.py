@@ -29,6 +29,7 @@ class AWQConfig:
     max_tokens_per_sample: int = 2048
     layer_batch_size: int = 16
     lmhead_chunks: int = 4
+    skip_lmhead: bool = True
 
 
 class AWQQuantizerXL:
@@ -391,6 +392,9 @@ class AWQQuantizerXL:
             for name, module in tqdm(batch_layers, desc="  Quantization", leave=False):
                 try:
                     is_lmhead = "lm_head" in name.lower() or name.endswith("lm_head")
+                    if is_lmhead and self.config.skip_lmhead:
+                        print(f"  Skipping lm_head (skip_lmhead=True): {name}")
+                        continue
                     if is_lmhead:
                         self.quantize_lmhead_half_by_half(
                             name,

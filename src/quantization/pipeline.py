@@ -31,6 +31,7 @@ def build_awq_config(args) -> AWQConfig:
         max_tokens_per_sample=args.max_tokens_per_sample,
         layer_batch_size=args.layer_batch_size,
         lmhead_chunks=args.lmhead_chunks,
+        skip_lmhead=args.skip_lmhead,
     )
 
 

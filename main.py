@@ -828,6 +828,10 @@ def build_parser():
         cmd.add_argument("--max-tokens-per-sample", type=int, default=2048)
         cmd.add_argument("--layer-batch-size", type=int, default=16)
         cmd.add_argument("--lmhead-chunks", type=int, default=4)
+        cmd.add_argument("--skip-lmhead", action="store_true", default=True,
+                         help="Skip quantizing lm_head (default: True)")
+        cmd.add_argument("--no-skip-lmhead", dest="skip_lmhead", action="store_false",
+                         help="Quantize lm_head as well")
         cmd.add_argument("--use-james-stein", action="store_true", default=True)
         cmd.add_argument("--no-james-stein", dest="use_james_stein", action="store_false")
         cmd.add_argument("--knee-tolerance", type=float, default=0.0)
